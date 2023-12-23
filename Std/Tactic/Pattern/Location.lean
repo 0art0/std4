@@ -145,6 +145,7 @@ These are exactly the variables introduced in the returned outer expression.
 partial def PatternAbstract (e : Expr) (p : AbstractMVarsResult) (occs : Occurrences := .all) : MetaM (Option PatternAbstractResult) := do
   let e ← instantiateMVars e
   withNewMCtxDepth do
+  withReducible do
   let (mvars, _, p) ← openAbstractMVarsResult p
   let mvarIds := mvars.map Expr.mvarId!
   if p.isFVar && occs == Occurrences.all then
