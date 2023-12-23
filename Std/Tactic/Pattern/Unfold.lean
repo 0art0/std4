@@ -47,11 +47,11 @@ open Elab.Tactic Pattern.Location
 
 /-- Unfold the selected expression in one of the following ways:
 
-- β-reduction: `(fun x₁ .. xₙ => t[x₁, .., xₙ]) a₁ .. aₙ` → `t[a₁, .., aₙ]`
-- η-reduction: `fun x₁ .. xₙ => f x₁ .. xₙ` → `f`
-- ζ-reduction: `let a := v; t[a]` → `t[v]`
-- projection reduction: `instAddNat.1 a b` → `Nat.add a b`
-- unfolding a constant: `Surjective f` → `∀ b, ∃ a, f a = b`
+- β-reduction: `(fun x₁ .. xₙ => t[x₁, .., xₙ]) a₁ .. aₙ` ↦ `t[a₁, .., aₙ]`
+- η-reduction: `fun x₁ .. xₙ => f x₁ .. xₙ` ↦ `f`
+- ζ-reduction: `let a := v; t[a]` ↦ `t[v]`
+- projection reduction: `instAddNat.1 a b` ↦ `Nat.add a b`
+- unfolding a constant: `Surjective f` ↦ `∀ b, ∃ a, f a = b`
 
 Note that we always reduce a projection after unfolding a constant,
 so that `@Add.add ℕ instAddNat a b` gives `Nat.add a b` instead of `instAddNat.1 a b`.

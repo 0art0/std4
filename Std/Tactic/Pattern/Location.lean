@@ -122,7 +122,7 @@ structure PatternAbstractResult where
   fvarDecls : List LocalDecl := []
 
 /-- `Lean.Expr.instantiat1` bumps up the bvar indices of loose bvars in `subst`.
-`instantiate1'` leaves `subst` untouched. -/
+`instantiate1'` leaves `subst` unchanged. -/
 private def instantiate1' (e subst : Expr) (depth := 0) : Expr :=
   match e with
     | .mdata m e => .mdata m (instantiate1' e subst depth)
