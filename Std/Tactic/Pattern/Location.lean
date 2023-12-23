@@ -104,14 +104,148 @@ end Pattern.Location
 
 open Pattern.Location
 
+private inductive PatternProgress where
+| noMatch : PatternProgress
+| someMatch : (pattern : Expr) → PatternProgress
+| finished : (pattern inner : Expr) → List LocalDecl → PatternProgress
+
+
+private abbrev M := ReaderT (List FVarId) StateRefT PatternProgress StateRefT Nat MetaM
+
+/-- the result of `patternAbstract`. -/
+structure PatternAbstractResult where
+  /-- the inner expression -/
+  inner : Expr
+  /-- the outer expression -/
+  outer : Expr := .bvar 0
+  /-- the pattern abstracted from the inner expression -/
+  pattern : Expr
+  /-- the fvar declarations of the variables introduced by the outer expression -/
+  fvarDecls : List LocalDecl := []
+
+/-- `Lean.Expr.instantiat1` bumps up the bvar indices of loose bvars in `subst`.
+`instantiate1'` leaves `subst` untouched. -/
+private def instantiate1' (e subst : Expr) (depth := 0) : Expr :=
+  match e with
+    | .mdata m e => .mdata m (instantiate1' e subst depth)
+    | .proj s i e => .proj s i (instantiate1' e subst depth)
+    | .app f a => .app (instantiate1' f subst depth) (instantiate1' a subst depth)
+    | .lam _ t b _ => e.updateLambdaE! (instantiate1' t subst depth) (instantiate1' b subst (depth+1))
+    | .forallE _ t b _ => e.updateForallE! (instantiate1' t subst depth) (instantiate1' b subst (depth+1))
+    | .letE _ t v b _ => e.updateLet! (instantiate1' t subst depth) (instantiate1' v subst depth) (instantiate1' b subst (depth+1))
+    | .bvar idx => if idx == depth then subst else e
+    | _ => e
+
+/--
+Find all occurence of a pattern, abstracting the locations of this pattern,
+also allowing for bound variables. The bound variables are replaced by free variables
+which are recorded in the field `.fvarDecls`.
+These are exactly the variables introduced in the returned outer expression.
+-/
+partial def PatternAbstract (e : Expr) (p : AbstractMVarsResult) (occs : Occurrences := .all) : MetaM (Option PatternAbstractResult) := do
+  let e ← instantiateMVars e
+  withNewMCtxDepth do
+  let (mvars, _, p) ← openAbstractMVarsResult p
+  let mvarIds := mvars.map Expr.mvarId!
+  if p.isFVar && occs == Occurrences.all then
+    return some {
+      inner := e.abstract #[p]
+      pattern := p }
+  else
+    let pHeadIdx := p.toHeadIndex
+    let pNumArgs := p.headNumArgs
+    let rec visit (e : Expr) : M Expr := do
+
+      let introFVar (n : Name) (d b : Expr) : M Expr :=
+        withLocalDeclD n d fun fvar =>
+        withReader (fvar.fvarId! :: ·) do
+          if let PatternProgress.noMatch ← get then
+            let lctx ← getLCtx
+            let mctx ← getMCtx
+            let refreshLCtx decls mvarId := decls.insert mvarId { decls.find! mvarId with lctx }
+            let decls := mvarIds.foldl (init := mctx.decls) refreshLCtx
+            setMCtx { mctx with decls }
+
+            let e ← visit (b.instantiate1 fvar)
+
+            match ← get with
+            | .noMatch =>
+              return b
+            | .someMatch pattern =>
+              if pattern.containsFVar fvar.fvarId! then
+                let fvarDecls ← liftMetaM $ (← read).mapM FVarId.getDecl
+                set (PatternProgress.finished pattern (e.abstract #[fvar]) fvarDecls)
+                return .bvar ((← read).length)
+              else
+                return e.abstract #[fvar]
+            | .finished .. =>
+              return e.abstract #[fvar]
+
+          else
+            let e ← visit (b.instantiate1 fvar)
+            return e.abstract #[fvar]
+
+      let visitChildren : Unit → M Expr := fun _ => do
+        match e with
+        | .app f a         => return e.updateApp! (← visit f) (← visit a)
+        | .mdata _ b       => return e.updateMData! (← visit b)
+        | .proj _ _ b      => return e.updateProj! (← visit b)
+        | .letE n t v b _  => return e.updateLet! (← visit t) (← visit v) (← introFVar n t b)
+        | .lam n d b _     => return e.updateLambdaE! (← visit d) (← introFVar n d b)
+        | .forallE n d b _ => return e.updateForallE! (← visit d) (← introFVar n d b)
+        | e                => return e
+      let processMatch : Unit → M Expr := fun _ => do
+        let i ← getThe Nat
+        set (i+1)
+        if occs.contains i then
+          return .bvar (← read).length
+        else
+          visitChildren ()
+
+      if e.toHeadIndex != pHeadIdx || e.headNumArgs != pNumArgs then
+        visitChildren ()
+      else
+
+        match ← get with
+          | .noMatch =>
+            let mctx ← getMCtx
+            if ← isDefEq e p then
+              set (PatternProgress.someMatch (← instantiateMVars p))
+              processMatch ()
+            else
+              setMCtx mctx
+              visitChildren ()
+          | .someMatch pattern =>
+            let mctx ← getMCtx
+            if ← isDefEq e pattern then
+              processMatch ()
+            else
+              setMCtx mctx
+              visitChildren ()
+          | .finished .. => return e
+
+    let (e, result) ← visit e |>.run [] |>.run .noMatch |>.run' 0
+    match result with
+    | .finished pattern inner fvarDecls =>
+      return some { inner, outer := e, pattern, fvarDecls }
+    | .someMatch pattern =>
+      return some { inner := e, pattern }
+    | .noMatch => return none
+
+/-- instantiate the `PatternAbstractResult` with `e`. -/
+def PatternAbstractResult.instantiate (p : PatternAbstractResult) (e : Expr) : Expr :=
+  let fvars := p.fvarDecls.toArray.map (.fvar ·.fvarId)
+  let inner := p.inner.instantiate fvars |>.instantiate1 e
+  instantiate1' p.outer (inner.abstract fvars.reverse)
+
+
 /-- Substitute occurrences of a pattern in an expression with the result of `replacement`. -/
 def substitute (e : Expr) (pattern : AbstractMVarsResult) (occs : Occurrences)
-    (replacement : Expr → MetaM Expr) : MetaM Expr := do
-  let (_, _, p) ← openAbstractMVarsResult pattern
-  let eAbst ← kabstract e p occs
-  unless eAbst.hasLooseBVars do
-    throwError m!"Failed to find instance of pattern {indentExpr p} in {indentExpr e}."
-  instantiateMVars <| Expr.instantiate1 eAbst (← replacement p)
+    (replace : Expr → MetaM Expr) : MetaM Expr := do
+  let some r ← PatternAbstract e pattern occs |
+    throwError m!"Failed to find instance of pattern {indentExpr (← openAbstractMVarsResult pattern).2.2} in {indentExpr e}."
+  let replacement ← withExistingLocalDecls r.fvarDecls (replace r.pattern)
+  return r.instantiate replacement
 
 /-- Replace the value of a local `let` hypothesis with `valNew`,
     which is assumed to be definitionally equal.
