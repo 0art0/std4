@@ -60,3 +60,9 @@ elab "unfold'" p:term locs:locs : tactic => withMainContext do
   let pattern ← expandPattern p
   let occurrences ← expandLocs locs
   replaceOccurrencesDefEq occurrences pattern replaceByDef
+
+@[irreducible] def f (n : Nat) := n+1
+example : ∀ n : Nat, n + 1 = f n := by
+  unfold' f _ at ⊢ --∀ (n : Nat), n + 1 = n + 1
+  intro n
+  rfl

@@ -118,8 +118,6 @@ structure PatternAbstractResult where
   inner : Expr
   /-- the outer expression -/
   outer : Expr := .bvar 0
-  /-- the pattern abstracted from the inner expression -/
-  pattern : Expr
   /-- the fvar declarations of the variables introduced by the outer expression -/
   fvarDecls : List LocalDecl := []
 
@@ -142,16 +140,14 @@ also allowing for bound variables. The bound variables are replaced by free vari
 which are recorded in the field `.fvarDecls`.
 These are exactly the variables introduced in the returned outer expression.
 -/
-partial def PatternAbstract (e : Expr) (p : AbstractMVarsResult) (occs : Occurrences := .all) : MetaM (Option PatternAbstractResult) := do
+partial def PatternAbstract (e : Expr) (p : AbstractMVarsResult) (occs : Occurrences := .all) : MetaM (Option (PatternAbstractResult × Expr)) := do
   let e ← instantiateMVars e
   withNewMCtxDepth do
   withReducible do
   let (mvars, _, p) ← openAbstractMVarsResult p
   let mvarIds := mvars.map Expr.mvarId!
   if p.isFVar && occs == Occurrences.all then
-    return some {
-      inner := e.abstract #[p]
-      pattern := p }
+    return some ({ inner := e.abstract #[p] }, p)
   else
     let pHeadIdx := p.toHeadIndex
     let pNumArgs := p.headNumArgs
@@ -228,9 +224,9 @@ partial def PatternAbstract (e : Expr) (p : AbstractMVarsResult) (occs : Occurre
     let (e, result) ← visit e |>.run [] |>.run .noMatch |>.run' 0
     match result with
     | .finished pattern inner fvarDecls =>
-      return some { inner, outer := e, pattern, fvarDecls }
+      return some ({ inner, outer := e, fvarDecls }, pattern)
     | .someMatch pattern =>
-      return some { inner := e, pattern }
+      return some ({ inner := e }, pattern)
     | .noMatch => return none
 
 /-- instantiate the `PatternAbstractResult` with `e`. -/
@@ -243,9 +239,9 @@ def PatternAbstractResult.instantiate (p : PatternAbstractResult) (e : Expr) : E
 /-- Substitute occurrences of a pattern in an expression with the result of `replacement`. -/
 def substitute (e : Expr) (pattern : AbstractMVarsResult) (occs : Occurrences)
     (replace : Expr → MetaM Expr) : MetaM Expr := do
-  let some r ← PatternAbstract e pattern occs |
+  let some (r, pattern) ← PatternAbstract e pattern occs |
     throwError m!"Failed to find instance of pattern {indentExpr (← openAbstractMVarsResult pattern).2.2} in {indentExpr e}."
-  let replacement ← withExistingLocalDecls r.fvarDecls (replace r.pattern)
+  let replacement ← withExistingLocalDecls r.fvarDecls (replace pattern)
   return r.instantiate replacement
 
 /-- Replace the value of a local `let` hypothesis with `valNew`,
