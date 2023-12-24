@@ -196,12 +196,12 @@ partial def PatternAbstract (e : Expr) (p : AbstractMVarsResult) (occs : Occurre
         | .forallE n d b _ => return e.updateForallE! (← visit d) (← introFVar n d b)
         | e                => return e
 
-      if e.toHeadIndex != pHeadIdx || e.headNumArgs != pNumArgs then
+      let progress ← get
+      if progress matches .finished .. then
+        return e
+      else if e.toHeadIndex != pHeadIdx || e.headNumArgs != pNumArgs then
         visitChildren ()
       else
-        let progress ← get
-        if progress matches .finished .. then
-          return e
         let mctx ← getMCtx
         if ← isDefEq e p then
           if progress matches .noMatch then
