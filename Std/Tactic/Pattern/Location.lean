@@ -134,6 +134,14 @@ private def instantiate1' (e subst : Expr) (depth := 0) : Expr :=
     | .bvar idx => if idx == depth then subst else e
     | _ => e
 
+/-- replace the  `LocalContext` of each mvar with the current `LocalContext`. -/
+def updateMVarLCtxs (mvarIds : Array MVarId) : MetaM Unit := do
+  let lctx ← getLCtx
+  let mctx ← getMCtx
+  let updateDecls decls mvarId := decls.insert mvarId { decls.find! mvarId with lctx }
+  let decls := mvarIds.foldl (init := mctx.decls) updateDecls
+  setMCtx { mctx with decls }
+
 /--
 Find all occurence of a pattern, abstracting the locations of this pattern,
 also allowing for bound variables. The bound variables are replaced by free variables
@@ -156,23 +164,19 @@ partial def PatternAbstract (e : Expr) (p : AbstractMVarsResult) (occs : Occurre
       let introFVar (n : Name) (d b : Expr) : M Expr :=
         withLocalDeclD n d fun fvar =>
         withReader (fvar.fvarId! :: ·) do
-          if let PatternProgress.noMatch ← get then
-            let lctx ← getLCtx
-            let mctx ← getMCtx
-            let refreshLCtx decls mvarId := decls.insert mvarId { decls.find! mvarId with lctx }
-            let decls := mvarIds.foldl (init := mctx.decls) refreshLCtx
-            setMCtx { mctx with decls }
-
+          if (← get) matches PatternProgress.noMatch then
+            updateMVarLCtxs mvarIds
             let e ← visit (b.instantiate1 fvar)
-
             match ← get with
             | .noMatch =>
               return b
             | .someMatch pattern =>
               if pattern.containsFVar fvar.fvarId! then
-                let fvarDecls ← liftMetaM $ (← read).mapM FVarId.getDecl
-                set (PatternProgress.finished pattern (e.abstract #[fvar]) fvarDecls)
-                return .bvar ((← read).length)
+                let fvarIds ← read
+                let fvarDecls ← liftM $ fvarIds.mapM FVarId.getDecl
+                let depth := fvarIds.length
+                set (PatternProgress.finished pattern (e.lowerLooseBVars depth depth) fvarDecls)
+                return .bvar depth
               else
                 return e.abstract #[fvar]
             | .finished .. =>
@@ -191,36 +195,26 @@ partial def PatternAbstract (e : Expr) (p : AbstractMVarsResult) (occs : Occurre
         | .lam n d b _     => return e.updateLambdaE! (← visit d) (← introFVar n d b)
         | .forallE n d b _ => return e.updateForallE! (← visit d) (← introFVar n d b)
         | e                => return e
-      let processMatch : Unit → M Expr := fun _ => do
-        let i ← getThe Nat
-        set (i+1)
-        if occs.contains i then
-          return .bvar (← read).length
-        else
-          visitChildren ()
 
       if e.toHeadIndex != pHeadIdx || e.headNumArgs != pNumArgs then
         visitChildren ()
       else
-
-        match ← get with
-          | .noMatch =>
-            let mctx ← getMCtx
-            if ← isDefEq e p then
-              set (PatternProgress.someMatch (← instantiateMVars p))
-              processMatch ()
-            else
-              setMCtx mctx
-              visitChildren ()
-          | .someMatch pattern =>
-            let mctx ← getMCtx
-            if ← isDefEq e pattern then
-              processMatch ()
-            else
-              setMCtx mctx
-              visitChildren ()
-          | .finished .. => return e
-
+        let progress ← get
+        if progress matches .finished .. then
+          return e
+        let mctx ← getMCtx
+        if ← isDefEq e p then
+          if progress matches .noMatch then
+            set (PatternProgress.someMatch (← instantiateMVars p))
+          let i ← getThe Nat
+          set (i+1)
+          if occs.contains i then
+            return .bvar (← read).length
+          else
+            setMCtx mctx
+            visitChildren ()
+        else
+          visitChildren ()
     let (e, result) ← visit e |>.run [] |>.run .noMatch |>.run' 0
     match result with
     | .finished pattern inner fvarDecls =>
@@ -231,9 +225,9 @@ partial def PatternAbstract (e : Expr) (p : AbstractMVarsResult) (occs : Occurre
 
 /-- instantiate the `PatternAbstractResult` with `e`. -/
 def PatternAbstractResult.instantiate (p : PatternAbstractResult) (e : Expr) : Expr :=
-  let fvars := p.fvarDecls.toArray.map (.fvar ·.fvarId)
-  let inner := p.inner.instantiate fvars |>.instantiate1 e
-  instantiate1' p.outer (inner.abstract fvars.reverse)
+  let fvars := p.fvarDecls.toArray.reverse.map (.fvar ·.fvarId)
+  let inner := p.inner.instantiate1 e |>.abstract fvars
+  instantiate1' p.outer inner
 
 
 /-- Substitute occurrences of a pattern in an expression with the result of `replacement`. -/
