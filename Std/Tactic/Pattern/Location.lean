@@ -107,32 +107,20 @@ open Pattern.Location
 private inductive PatternProgress where
 | noMatch : PatternProgress
 | someMatch : (pattern : Expr) → PatternProgress
-| finished : (pattern inner : Expr) → List LocalDecl → PatternProgress
+| finished : (pattern : Expr) → SubExpr.Pos → List LocalDecl → PatternProgress
 
 
 private abbrev M := ReaderT (List FVarId) StateRefT PatternProgress StateRefT Nat MetaM
 
-/-- the result of `patternAbstract`. -/
+/-- The result of `patternAbstract`. -/
 structure PatternAbstractResult where
-  /-- the inner expression -/
-  inner : Expr
-  /-- the outer expression -/
-  outer : Expr := .bvar 0
-  /-- the fvar declarations of the variables introduced by the outer expression -/
+  /-- The position closest to the root such that all bound variables appearing in the
+  instantiated pattern are bound at this position. -/
+  pos : SubExpr.Pos := .root
+  /-- The original expression with instances of the pattern abstracted. -/
+  expr : Expr
+  /-- The declarations of the free variables introduced by viewing position `pos` in `expr`. -/
   fvarDecls : List LocalDecl := []
-
-/-- `Lean.Expr.instantiat1` bumps up the bvar indices of loose bvars in `subst`.
-`instantiate1'` leaves `subst` unchanged. -/
-private def instantiate1' (e subst : Expr) (depth := 0) : Expr :=
-  match e with
-    | .mdata m e => .mdata m (instantiate1' e subst depth)
-    | .proj s i e => .proj s i (instantiate1' e subst depth)
-    | .app f a => .app (instantiate1' f subst depth) (instantiate1' a subst depth)
-    | .lam _ t b _ => e.updateLambdaE! (instantiate1' t subst depth) (instantiate1' b subst (depth+1))
-    | .forallE _ t b _ => e.updateForallE! (instantiate1' t subst depth) (instantiate1' b subst (depth+1))
-    | .letE _ t v b _ => e.updateLet! (instantiate1' t subst depth) (instantiate1' v subst depth) (instantiate1' b subst (depth+1))
-    | .bvar idx => if idx == depth then subst else e
-    | _ => e
 
 /-- replace the  `LocalContext` of each mvar with the current `LocalContext`. -/
 def updateMVarLCtxs (mvarIds : Array MVarId) : MetaM Unit := do
@@ -155,45 +143,41 @@ partial def PatternAbstract (e : Expr) (p : AbstractMVarsResult) (occs : Occurre
   let (mvars, _, p) ← openAbstractMVarsResult p
   let mvarIds := mvars.map Expr.mvarId!
   if p.isFVar && occs == Occurrences.all then
-    return some ({ inner := e.abstract #[p] }, p)
+    return some ({ expr := e.abstract #[p] }, p)
   else
     let pHeadIdx := p.toHeadIndex
     let pNumArgs := p.headNumArgs
-    let rec visit (e : Expr) : M Expr := do
+    let rec visit (pos : SubExpr.Pos) (e : Expr) : M Expr := do
 
-      let introFVar (n : Name) (d b : Expr) : M Expr :=
+      let introFVar (pos : SubExpr.Pos) (n : Name) (d b : Expr) : M Expr :=
         withLocalDeclD n d fun fvar =>
         withReader (fvar.fvarId! :: ·) do
           if (← get) matches PatternProgress.noMatch then
             updateMVarLCtxs mvarIds
-            let e ← visit (b.instantiate1 fvar)
+            let e ← visit pos (b.instantiate1 fvar)
             match ← get with
             | .noMatch =>
               return b
             | .someMatch pattern =>
               if pattern.containsFVar fvar.fvarId! then
-                let fvarIds ← read
-                let fvarDecls ← liftM $ fvarIds.mapM FVarId.getDecl
-                let depth := fvarIds.length
-                set (PatternProgress.finished pattern (e.lowerLooseBVars depth depth) fvarDecls)
-                return .bvar depth
-              else
-                return e.abstract #[fvar]
+                let fvarDecls ← liftM $ (← read).mapM FVarId.getDecl
+                set (PatternProgress.finished pattern pos fvarDecls)
+              return e.abstract #[fvar]
             | .finished .. =>
               return e.abstract #[fvar]
 
           else
-            let e ← visit (b.instantiate1 fvar)
+            let e ← visit pos (b.instantiate1 fvar)
             return e.abstract #[fvar]
 
       let visitChildren : Unit → M Expr := fun _ => do
         match e with
-        | .app f a         => return e.updateApp! (← visit f) (← visit a)
-        | .mdata _ b       => return e.updateMData! (← visit b)
-        | .proj _ _ b      => return e.updateProj! (← visit b)
-        | .letE n t v b _  => return e.updateLet! (← visit t) (← visit v) (← introFVar n t b)
-        | .lam n d b _     => return e.updateLambdaE! (← visit d) (← introFVar n d b)
-        | .forallE n d b _ => return e.updateForallE! (← visit d) (← introFVar n d b)
+        | .app f a         => return e.updateApp! (← visit pos.pushAppFn f) (← visit pos.pushAppArg a)
+        | .mdata _ b       => return e.updateMData! (← visit pos b)
+        | .proj _ _ b      => return e.updateProj! (← visit pos.pushProj b)
+        | .letE n t v b _  => return e.updateLet! (← visit pos.pushLetVarType t) (← visit pos.pushLetValue v) (← introFVar pos.pushLetBody n t b)
+        | .lam n d b _     => return e.updateLambdaE! (← visit pos.pushBindingDomain d) (← introFVar pos.pushBindingBody n d b)
+        | .forallE n d b _ => return e.updateForallE! (← visit pos.pushBindingDomain d) (← introFVar pos.pushBindingBody n d b)
         | e                => return e
 
       let progress ← get
@@ -215,20 +199,53 @@ partial def PatternAbstract (e : Expr) (p : AbstractMVarsResult) (occs : Occurre
             visitChildren ()
         else
           visitChildren ()
-    let (e, result) ← visit e |>.run [] |>.run .noMatch |>.run' 0
-    match result with
-    | .finished pattern inner fvarDecls =>
-      return some ({ inner, outer := e, fvarDecls }, pattern)
+    let (expr, progress) ← visit SubExpr.Pos.root e |>.run [] |>.run .noMatch |>.run' 0
+    match progress with
+    | .finished pattern pos fvarDecls =>
+      return some ({ expr, pos, fvarDecls }, pattern)
     | .someMatch pattern =>
-      return some ({ inner := e }, pattern)
+      return some ({ expr }, pattern)
     | .noMatch => return none
 
-/-- instantiate the `PatternAbstractResult` with `e`. -/
-def PatternAbstractResult.instantiate (p : PatternAbstractResult) (e : Expr) : Expr :=
-  let fvars := p.fvarDecls.toArray.reverse.map (.fvar ·.fvarId)
-  let inner := p.inner.instantiate1 e |>.abstract fvars
-  instantiate1' p.outer inner
+section
+/- This section follows the definition of `Lean.Meta.replaceSubexpr` -/
+variable {M} [Monad M] [MonadLiftT MetaM M] [MonadControlT MetaM M] [MonadError M]
 
+/-- Given a constructor index for Expr, runs `g` on the value of that subexpression and replaces it.
+Mdata is ignored. An index of 3 is interpreted as the type of the expression. An index of 3 will throw since we can't replace types.
+
+See also `Lean.Meta.transform`, `Lean.Meta.traverseChildren`. -/
+private def lensCoordRaw (g : Expr → M Expr) : Nat → Expr → M Expr
+  | 0, e@(Expr.app f a)         => return e.updateApp! (← g f) a
+  | 1, e@(Expr.app f a)         => return e.updateApp! f (← g a)
+  | 0, e@(Expr.lam _ y b _)     => return e.updateLambdaE! (← g y) b
+  | 1, e@(Expr.lam _ y b _)     => return e.updateLambdaE! y (← g b)
+  | 0, e@(Expr.forallE _ y b _) => return e.updateForallE! (← g y) b
+  | 1, e@(Expr.forallE _ y b _) => return e.updateForallE! y (← g b)
+  | 0, e@(Expr.letE _ y a b _)  => return e.updateLet! (← g y) a b
+  | 1, e@(Expr.letE _ y a b _)  => return e.updateLet! y (← g a) b
+  | 2, e@(Expr.letE _ y a b _)  => return e.updateLet! y a (← g b)
+  | 0, e@(Expr.proj _ _ b)      => e.updateProj! <$> g b
+  | n, e@(Expr.mdata _ a)       => e.updateMData! <$> lensCoordRaw g n a
+  | 3, _                        => throwError "Lensing on types is not supported"
+  | c, e                        => throwError "Invalid coordinate {c} for {e}"
+
+private def lensRawAux (g : Expr → M Expr) : List Nat → Expr → M Expr
+  | []        , e => g e
+  | head::tail, e => lensCoordRaw (lensRawAux g tail) head e
+
+/-- Run the given `replace` function to replace the expression at the subexpression position.
+If the subexpression is invalid or points to a type then this will throw. -/
+def replaceSubexprRaw (p : SubExpr.Pos) (root : Expr) (replace : (subexpr : Expr) → M Expr) : M Expr :=
+  lensRawAux replace p.toArray.toList root
+
+/-- instantiate the `PatternAbstractResult` with `e`. -/
+def PatternAbstractResult.instantiate (p : PatternAbstractResult) (e : Expr) : M Expr :=
+  replaceSubexprRaw p.pos p.expr fun subexpr =>
+  let fvars := p.fvarDecls.toArray.reverse.map (.fvar ·.fvarId)
+  return ((subexpr.instantiateRev fvars).instantiate1 e).abstract fvars
+
+end
 
 /-- Substitute occurrences of a pattern in an expression with the result of `replacement`. -/
 def substitute (e : Expr) (pattern : AbstractMVarsResult) (occs : Occurrences)
@@ -236,7 +253,7 @@ def substitute (e : Expr) (pattern : AbstractMVarsResult) (occs : Occurrences)
   let some (r, pattern) ← PatternAbstract e pattern occs |
     throwError m!"Failed to find instance of pattern {indentExpr (← openAbstractMVarsResult pattern).2.2} in {indentExpr e}."
   let replacement ← withExistingLocalDecls r.fvarDecls (replace pattern)
-  return r.instantiate replacement
+  r.instantiate replacement
 
 /-- Replace the value of a local `let` hypothesis with `valNew`,
     which is assumed to be definitionally equal.
