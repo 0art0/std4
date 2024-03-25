@@ -23,17 +23,28 @@ open Lean Meta Elab Tactic
 
 namespace Pattern.Location
 
-/-- A hypothesis location can be
-    - a wildcard, which refers to all hypotheses in the local context simultaneously
-    - a specific hypothesis in the local context -/
-syntax hypLoc := "at" ppSpace ("*" <|> ident)
+open Parser.Tactic.Conv
 
-/-- A value location refers to the body of a local `let` declaration. -/
-syntax valLoc := "in" ppSpace ident
+/-- The `|-` or `⊢` pattern representing the goal. -/
+syntax goalPattern := patternIgnore( atomic("|" noWs "-") <|> "⊢")
 
-open Parser.Tactic.Conv in
-/-- A location in the goal state with occurrences optionally specified. -/
-syntax loc := ppSpace withPosition((hypLoc <|> valLoc)? (occs)?)
+/-- A location in the goal state, which is either
+    - a hypothesis (parsed by `ident`), or
+    - the target (parsed by `goalPattern`). -/
+syntax loc := ident <|> goalPattern
+
+/--
+A bracketed location contains additional information about occurrences within a location.
+When the location is a local `let` hypothesis, the `in let-value` modifier
+allows targeting the body instead of the type of the hypothesis. -/
+syntax bracketedLoc := "‹" (ident ppSpace (occs)? (ppSpace "in let-value")?) <|>
+                            (goalPattern ppSpace occs) "›"
+
+/-- The wildcard location which refers to all valid locations. -/
+syntax wildcardLoc := "*"
+
+/-- A list of locations in the goal state with occurrences optionally specified. -/
+syntax locs := ppSpace withPosition("at" ppSpace (wildcardLoc <|> (loc <|> bracketedLoc)*))
 
 /-- Occurrences at a goal location. This is similar to `SubExpr.GoalLocation`. -/
 inductive GoalOccurrences
@@ -55,33 +66,43 @@ def expandOccs : Option (TSyntax ``occs) → Occurrences
       | `(occs| (occs := $ids*)) => .pos <| ids.map TSyntax.getNat |>.toList
       | _ => panic! s!"Invalid syntax {occs} for occurrences."
 
-/-- Interpret `loc` syntax as an array of `GoalOccurrences`. -/
-def expandLoc : TSyntax ``loc → TacticM (Array GoalOccurrences)
-| `(loc| $[$loc?]? $[$occs?]?) =>
-  match loc? with
-  |   none   => return #[.target (expandOccs occs?)]
-  | some loc =>
-    match loc with
-    | `(hypLoc| at *)    => withMainContext do
-      -- TODO: Maybe reverse the list of declarations, following `Lean/Elab/Tactic/Location.lean`
-      (← getLCtx).decls.foldlM (init := #[.target .all]) fun goalOccs decl? => do
-        match decl? with
-        | some decl =>
-          if decl.isImplementationDetail then
-            return goalOccs
-          else
-            let goalOccs :=
-              if decl.isLet then
-                goalOccs.push <| .hypValue decl.fvarId .all
-              else goalOccs
-            return goalOccs.push <| .hypType decl.fvarId .all
-        | none => return goalOccs
-    | `(hypLoc| at $hyp) => withMainContext do
-      return #[.hypType (← getFVarId hyp) (expandOccs occs?)]
-    | `(valLoc| in $hyp) => withMainContext do
-      return #[.hypValue (← getFVarId hyp) (expandOccs occs?)]
-    |          _         => return #[.target .all]
-| _ => throwUnsupportedSyntax
+/-- Interpret `locs` syntax as an array of `GoalOccurrences`. -/
+def expandLocs : TSyntax ``locs → TacticM (Array GoalOccurrences)
+  | `(locs| at $_:wildcardLoc) => withMainContext do
+    -- TODO: Maybe reverse the list of declarations, following `Lean/Elab/Tactic/Location.lean`
+    (← getLCtx).decls.foldlM (init := #[.target .all]) fun goalOccs decl? => do
+      match decl? with
+      | some decl =>
+        if decl.isImplementationDetail then
+          return goalOccs
+        else
+          let goalOccs :=
+            if decl.isLet then
+              goalOccs.push <| .hypValue decl.fvarId .all
+            else goalOccs
+          return goalOccs.push <| .hypType decl.fvarId .all
+      | none => return goalOccs
+  | `(locs| at $hyps*) => withMainContext do
+    hyps.mapM fun
+      | `(loc| $loc:loc) => expandLoc loc
+      | `(bracketedLoc| $bracketedLoc:bracketedLoc) => expandBracketedLoc bracketedLoc
+      |   _  => throwUnsupportedSyntax
+  | _ => throwUnsupportedSyntax
+where
+  /-- Interpet `loc` syntax as `GoalOccurrences`. -/
+  expandLoc : TSyntax ``loc → TacticM GoalOccurrences
+    | `(loc| $hyp:ident) => do return .hypType (← getFVarId hyp) .all
+    | `(loc| $_:goalPattern) => do return .target .all
+    | _ => throwUnsupportedSyntax
+  /-- Interpret `bracketedLoc` syntax as `GoalOccurrences`. -/
+  expandBracketedLoc : TSyntax ``bracketedLoc → TacticM GoalOccurrences
+    | `(bracketedLoc| ‹$hyp:ident $[$occs]?›) => do
+      return .hypType (← getFVarId hyp) (expandOccs occs)
+    | `(bracketedLoc| ‹$hyp:ident $[$occs]? in let-value›) => do
+      return .hypValue (← getFVarId hyp) (expandOccs occs)
+    | `(bracketedLoc| ‹$_:goalPattern $occs›) => do
+      return .target (expandOccs occs)
+    | _ => throwUnsupportedSyntax
 
 end Pattern.Location
 
@@ -90,10 +111,10 @@ open Pattern.Location
 
 /-- Substitute occurrences of a pattern in an expression with the result of `replacement`. -/
 def substitute (e : Expr) (pattern : AbstractMVarsResult) (occs : Occurrences)
-    (replacement : Expr → MetaM Expr) (withoutErr : Bool := true) : MetaM Expr := do
+    (replacement : Expr → MetaM Expr) : MetaM Expr := do
   let (_, _, p) ← openAbstractMVarsResult pattern
   let eAbst ← kabstract e p occs
-  unless eAbst.hasLooseBVars || withoutErr do
+  unless eAbst.hasLooseBVars do
     throwError m!"Failed to find instance of pattern {indentExpr p} in {indentExpr e}."
   instantiateMVars <| Expr.instantiate1 eAbst (← replacement p)
 
